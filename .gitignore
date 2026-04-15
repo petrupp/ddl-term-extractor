@@ -1,0 +1,21 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# SQLite 누적 DB (로컬 전용)
+data/*.db
+data/*.db-wal
+data/*.db-shm
+
+# Streamlit 캐시
+.streamlit/secrets.toml
+
+# 테스트로 생성된 산출물
+tests/output_test.xlsx
