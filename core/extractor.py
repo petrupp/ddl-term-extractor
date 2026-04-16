@@ -8,6 +8,7 @@ from __future__ import annotations
 import re
 
 from core.parser import TableInfo, ColumnInfo
+from core.domain_catalog import apply_domain_row, match_domain_row
 
 
 HEADER = [
@@ -71,7 +72,7 @@ _DOMAIN_SUFFIXES: list[str] = [
     "일련번호", "순번", "번호",
     "IP주소", "주소",
     "일시", "일자", "날짜", "시각",
-    "금액", "단가",
+    "금액", "가격", "가액", "비용", "단가",
     "비율", "율",
     "수량", "건수", "횟수", "량", "수",
     "기록",
@@ -126,11 +127,14 @@ def _format_pg_type(col: ColumnInfo) -> tuple[str, str]:
 def _build_infotype(domain: str, pg_base: str, length: int | None, scale: int | None) -> str:
     """인포타입 생성: 도메인명 + 타입약어 + 길이정보
 
+    domain이 빈 문자열이면 표준도메인 미매칭으로 보고 타입약어+길이만 붙인다 (예: VC50, INT, TS).
+
     예: ID + VC + 50 → IDVC50
         일시 + TS → 일시TS
         량 + NM + 5,1 → 량NM5.1
         금액 + NM → 금액NM
         여부 + CH + 1 → 여부CH1
+        (빈 도메인) + VC + 50 → VC50
     """
     abbr = _TYPE_ABBR.get(pg_base, pg_base[:2])
 
@@ -144,9 +148,17 @@ def _build_infotype(domain: str, pg_base: str, length: int | None, scale: int | 
     return f"{domain}{abbr}{size_part}"
 
 
-def tables_to_records(tables: list[TableInfo]) -> list[dict[str, str]]:
-    """TableInfo 리스트를 DA# 용어사전 양식 딕셔너리 리스트로 변환"""
+def tables_to_records(
+    tables: list[TableInfo],
+    domain_catalog: list[dict] | None = None,
+) -> list[dict[str, str]]:
+    """TableInfo 리스트를 DA# 용어사전 양식 딕셔너리 리스트로 변환.
+
+    domain_catalog: 표준도메인사전(DB). 있으면 접미어 도메인+PG타입이 맞을 때
+    도메인명·인포타입·데이터타입을 사전 정의로 채운다.
+    """
     rows: list[dict[str, str]] = []
+    catalog = domain_catalog or []
 
     for table in tables:
         for col in table.columns:
@@ -155,18 +167,35 @@ def tables_to_records(tables: list[TableInfo]) -> list[dict[str, str]]:
             term_eng = col.column_name.lower()
 
             pg_full, pg_base = _format_pg_type(col)
-            infotype = _build_infotype(
-                _extract_domain(comment) if comment else "",
-                pg_base, col.length, col.scale,
-            )
+            extracted = _extract_domain(comment) if comment else ""
+
+            d_name = ""
+            dtype_out = pg_full
+            itype_out = ""
+
+            if catalog and extracted:
+                hit = match_domain_row(
+                    extracted, pg_full, pg_base, col.length, col.scale, catalog
+                )
+                if hit:
+                    d_name, dtype_out, itype_out = apply_domain_row(
+                        hit, pg_full, pg_base, col.length, col.scale
+                    )
+
+            if not itype_out:
+                # 표준도메인에 없거나 접미만 있고 매칭 실패: 한글 접두 없이 약어+길이만 (VC50, TS, …)
+                if extracted:
+                    itype_out = f"{extracted}{pg_full}"
+                else:
+                    itype_out = _build_infotype("", pg_base, col.length, col.scale)
 
             rows.append({
                 "용어명": term_name,
                 "용어영문명": term_eng,
                 "용어정의": "",
-                "도메인명": "",
-                "인포타입": infotype,
-                "데이터타입": pg_full,
+                "도메인명": d_name,
+                "인포타입": itype_out,
+                "데이터타입": dtype_out,
             })
 
     return rows

@@ -1,15 +1,35 @@
-"""SQLite 기반 용어사전 저장소 - 중복 제거(UPSERT) 및 누적 관리"""
+"""SQLite term dictionary storage (UPSERT, accumulative)."""
 
 from __future__ import annotations
 
+import json
 import sqlite3
-from pathlib import Path
 from datetime import datetime
-
-from core.extractor import HEADER
+from pathlib import Path
 
 _DB_DIR = Path(__file__).resolve().parent.parent / "data"
 _DB_PATH = _DB_DIR / "terms.db"
+_SEED_PATH = Path(__file__).resolve().parent / "domain_seed.json"
+
+_CREATE_META_SQL = """
+CREATE TABLE IF NOT EXISTS app_meta (
+    k TEXT PRIMARY KEY,
+    v TEXT
+)
+"""
+
+_CREATE_DOMAINS_SQL = """
+CREATE TABLE IF NOT EXISTS standard_domains (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain_group    TEXT,
+    domain_name     TEXT NOT NULL,
+    data_type       TEXT NOT NULL,
+    length          INTEGER,
+    scale           INTEGER,
+    info_type       TEXT,
+    note            TEXT
+)
+"""
 
 _CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS terms (
@@ -38,13 +58,27 @@ ON CONFLICT(term_eng) DO UPDATE SET
 """
 
 _HEADER_TO_COL = {
-    "용어명": "term_name",
-    "용어영문명": "term_eng",
-    "용어정의": "term_def",
-    "도메인명": "domain_name",
-    "인포타입": "info_type",
-    "데이터타입": "data_type",
+    "\uC6A9\uC5B4\uBA85": "term_name",
+    "\uC6A9\uC5B4\uC601\uBB38\uBA85": "term_eng",
+    "\uC6A9\uC5B4\uC815\uC758": "term_def",
+    "\uB3C4\uBA54\uC778\uBA85": "domain_name",
+    "\uC778\uD3EC\uD0C0\uC785": "info_type",
+    "\uB370\uC774\uD130\uD0C0\uC785": "data_type",
 }
+
+
+def _load_default_domain_seed() -> list[
+    tuple[str, str, str, int | None, int | None, str, str | None]
+]:
+    raw = json.loads(_SEED_PATH.read_text(encoding="utf-8"))
+    out: list[tuple[str, str, str, int | None, int | None, str, str | None]] = []
+    for row in raw:
+        g, n, dt, lg, sc, it, note = row
+        out.append((g, n, dt, lg, sc, it, note))
+    return out
+
+
+_DEFAULT_DOMAIN_SEED = _load_default_domain_seed()
 
 
 def _ensure_db() -> Path:
@@ -57,36 +91,93 @@ def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(_CREATE_SQL)
+    conn.execute(_CREATE_META_SQL)
+    conn.execute(_CREATE_DOMAINS_SQL)
     conn.commit()
+    _migrate_domains_schema(conn)
+    _ensure_domain_seed_once(conn)
     return conn
 
 
+def _migrate_domains_schema(conn: sqlite3.Connection) -> None:
+    cur = conn.execute("PRAGMA table_info(standard_domains)")
+    cols = {row[1] for row in cur.fetchall()}
+    if not cols:
+        return
+    if "domain_group" not in cols:
+        conn.execute("ALTER TABLE standard_domains ADD COLUMN domain_group TEXT")
+        conn.commit()
+        cols.add("domain_group")
+    if "pg_base_type" not in cols:
+        return
+    conn.executescript(
+        """
+        CREATE TABLE standard_domains__new (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            domain_group    TEXT,
+            domain_name     TEXT NOT NULL,
+            data_type       TEXT NOT NULL,
+            length          INTEGER,
+            scale           INTEGER,
+            info_type       TEXT,
+            note            TEXT
+        );
+        INSERT INTO standard_domains__new (
+            domain_group, domain_name, data_type, length, scale, info_type, note
+        )
+        SELECT
+            domain_group,
+            domain_name,
+            UPPER(TRIM(COALESCE(pg_base_type, ''))),
+            length,
+            scale,
+            info_type,
+            note
+        FROM standard_domains;
+        DROP TABLE standard_domains;
+        ALTER TABLE standard_domains__new RENAME TO standard_domains;
+        """
+    )
+    conn.commit()
+
+
+def _ensure_domain_seed_once(conn: sqlite3.Connection) -> None:
+    if conn.execute("SELECT 1 FROM app_meta WHERE k = 'domains_init_v1'").fetchone():
+        return
+    conn.executemany(
+        """
+        INSERT INTO standard_domains (domain_group, domain_name, data_type, length, scale, info_type, note)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        _DEFAULT_DOMAIN_SEED,
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO app_meta (k, v) VALUES ('domains_init_v1', '1')"
+    )
+    conn.commit()
+
+
 def upsert_records(records: list[dict[str, str]]) -> tuple[int, int]:
-    """레코드를 DB에 UPSERT. (신규 건수, 갱신 건수) 반환."""
     conn = _connect()
     try:
         before_count = conn.execute("SELECT COUNT(*) FROM terms").fetchone()[0]
-
         now = datetime.now().isoformat()
         rows = [
             (
-                r.get("용어명", ""),
-                r.get("용어영문명", ""),
-                r.get("용어정의", ""),
-                r.get("도메인명", ""),
-                r.get("인포타입", ""),
-                r.get("데이터타입", ""),
+                r.get("\uC6A9\uC5B4\uBA85", ""),
+                r.get("\uC6A9\uC5B4\uC601\uBB38\uBA85", ""),
+                r.get("\uC6A9\uC5B4\uC815\uC758", ""),
+                r.get("\uB3C4\uBA54\uC778\uBA85", ""),
+                r.get("\uC778\uD3EC\uD0C0\uC785", ""),
+                r.get("\uB370\uC774\uD130\uD0C0\uC785", ""),
                 now,
             )
             for r in records
-            if r.get("용어영문명", "").strip()
+            if r.get("\uC6A9\uC5B4\uC601\uBB38\uBA85", "").strip()
         ]
-
         conn.executemany(_UPSERT_SQL, rows)
         conn.commit()
-
         after_count = conn.execute("SELECT COUNT(*) FROM terms").fetchone()[0]
-
         inserted = after_count - before_count
         updated = len(rows) - inserted
         return inserted, updated
@@ -95,7 +186,6 @@ def upsert_records(records: list[dict[str, str]]) -> tuple[int, int]:
 
 
 def fetch_all() -> list[dict[str, str]]:
-    """DB 전체 용어를 HEADER 딕셔너리 리스트로 반환."""
     conn = _connect()
     try:
         cur = conn.execute(
@@ -104,7 +194,6 @@ def fetch_all() -> list[dict[str, str]]:
         )
         col_to_header = {v: k for k, v in _HEADER_TO_COL.items()}
         db_cols = ["term_name", "term_eng", "term_def", "domain_name", "info_type", "data_type"]
-
         return [
             {col_to_header[db_cols[i]]: (val or "") for i, val in enumerate(row)}
             for row in cur.fetchall()
@@ -114,7 +203,6 @@ def fetch_all() -> list[dict[str, str]]:
 
 
 def get_stats() -> dict[str, int]:
-    """DB 통계 반환."""
     conn = _connect()
     try:
         total = conn.execute("SELECT COUNT(*) FROM terms").fetchone()[0]
@@ -127,7 +215,6 @@ def get_stats() -> dict[str, int]:
 
 
 def clear_all_terms() -> int:
-    """누적된 모든 용어 행을 삭제하고, AUTOINCREMENT 시퀀스를 초기화. 삭제된 건수 반환."""
     conn = _connect()
     try:
         before = conn.execute("SELECT COUNT(*) FROM terms").fetchone()[0]
@@ -135,5 +222,116 @@ def clear_all_terms() -> int:
         conn.execute("DELETE FROM sqlite_sequence WHERE name = 'terms'")
         conn.commit()
         return before
+    finally:
+        conn.close()
+
+
+def clear_all_domains() -> int:
+    """Delete all standard_domains rows; return count. Keeps app_meta (no auto re-seed)."""
+    conn = _connect()
+    try:
+        before = conn.execute("SELECT COUNT(*) FROM standard_domains").fetchone()[0]
+        conn.execute("DELETE FROM standard_domains")
+        conn.execute("DELETE FROM sqlite_sequence WHERE name = 'standard_domains'")
+        conn.commit()
+        return before
+    finally:
+        conn.close()
+
+
+def _to_opt_int(val: object) -> int | None:
+    if val is None or val == "":
+        return None
+    try:
+        if isinstance(val, float):
+            import math
+
+            if math.isnan(val):
+                return None
+        return int(float(val))
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_all_domains() -> list[dict]:
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "SELECT id, domain_group, domain_name, data_type, length, info_type, note "
+            "FROM standard_domains ORDER BY COALESCE(domain_group,''), domain_name, data_type, length"
+        )
+        cols = [
+            "id",
+            "domain_group",
+            "domain_name",
+            "data_type",
+            "length",
+            "info_type",
+            "note",
+        ]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def fetch_domain_catalog_for_match() -> list[dict]:
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "SELECT domain_name, data_type, length, info_type "
+            "FROM standard_domains ORDER BY domain_name, data_type"
+        )
+        out: list[dict] = []
+        for domain_name, data_type, length, info_type in cur.fetchall():
+            out.append({
+                "domain_name": domain_name or "",
+                "data_type": (data_type or "").upper(),
+                "length": length,
+                "info_type": info_type,
+            })
+        return out
+    finally:
+        conn.close()
+
+
+def replace_all_domains(records: list[dict]) -> int:
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM standard_domains")
+        n = 0
+        ins = """
+        INSERT INTO standard_domains (domain_group, domain_name, data_type, length, scale, info_type, note)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """
+        for r in records:
+            dn = str(r.get("domain_name", "") or "").strip()
+            dt = str(r.get("data_type", "") or "").strip()
+            if not dn or not dt:
+                continue
+            dg = str(r.get("domain_group", "") or "").strip() or None
+            length = _to_opt_int(r.get("length"))
+            it = str(r.get("info_type", "") or "").strip() or None
+            note = str(r.get("note", "") or "").strip() or None
+            conn.execute(ins, (dg, dn, dt.upper(), length, None, it, note))
+            n += 1
+        conn.commit()
+        return n
+    finally:
+        conn.close()
+
+
+def reset_domains_to_defaults() -> int:
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM standard_domains")
+        conn.executemany(
+            """
+            INSERT INTO standard_domains (domain_group, domain_name, data_type, length, scale, info_type, note)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            _DEFAULT_DOMAIN_SEED,
+        )
+        conn.commit()
+        return len(_DEFAULT_DOMAIN_SEED)
     finally:
         conn.close()
